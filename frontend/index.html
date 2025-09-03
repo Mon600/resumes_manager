@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Вход и регистрация</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>Добро пожаловать</h1>
+
+    <!-- Форма регистрации -->
+    <div class="form-section">
+      <h2>Регистрация</h2>
+      <form id="registerForm">
+        <input type="email" name="email" placeholder="Email" required />
+        <input type="text" name="first_name" placeholder="Имя" />
+        <input type="text" name="last_name" placeholder="Фамилия" />
+        <input type="password" name="password" placeholder="Пароль" required />
+        <input type="password" name="password_repeat" placeholder="Повторите пароль" required />
+        <button type="submit">Зарегистрироваться</button>
+      </form>
+    </div>
+
+    <hr />
+
+    <!-- Форма входа -->
+    <div class="form-section">
+      <h2>Вход</h2>
+      <form id="loginForm">
+        <input type="email" name="email" placeholder="Email" required />
+        <input type="password" name="password" placeholder="Пароль" required />
+        <button type="submit">Войти</button>
+      </form>
+    </div>
+
+    <div id="message" class="message"></div>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>

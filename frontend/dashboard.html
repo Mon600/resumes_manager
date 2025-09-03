@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Мои резюме</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>Мои резюме</h1>
+
+    <!-- Кнопка выхода -->
+    <button id="logoutBtn" class="btn-logout">Выйти</button>
+
+    <!-- Форма добавления резюме -->
+    <div class="form-section">
+      <h3>Создать новое резюме</h3>
+      <form id="createResumeForm">
+        <input type="text" name="title" placeholder="Название" required />
+        <textarea name="content" placeholder="Описание (до 1024 символов)" rows="3" maxlength="1024"></textarea>
+        <button type="submit">Создать</button>
+      </form>
+    </div>
+
+    <!-- Список резюме -->
+    <div id="resumesList">
+      <p>Загрузка...</p>
+    </div>
+
+    <!-- Модальное окно редактирования -->
+    <div id="editModal" class="modal">
+      <div class="modal-content">
+        <span class="close">&times;</span>
+        <h3>Редактировать резюме</h3>
+        <form id="editResumeForm">
+          <input type="hidden" name="id" />
+          <input type="text" name="title" placeholder="Название" required />
+          <textarea name="content" placeholder="Описание" rows="3" maxlength="1024"></textarea>
+          <button type="submit">Сохранить</button>
+        </form>
+      </div>
+    </div>
+
+    <div id="message" class="message"></div>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>

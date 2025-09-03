@@ -1,0 +1,810 @@
+import uvicorn
+from fastapi import FastAPI
+from src.api.routers.auth_router import router as auth
+from src.api.routers.resumes_router import router as resume
+app = FastAPI()
+
+app.include_router(auth)
+app.include_router(resume)
+
+if __name__ == "__main__":
+    uvicorn.run(app)
+
+
+from typing import Annotated
+
+from fastapi.params import Depends
+
+from src.db.repositories.resume_repository import ResumeRepository
+from src.db.repositories.user_repository import UserRepository
+from src.api.DI.session_depends import session_dep
+
+
+async def get_user_repository(session: session_dep) -> UserRepository:
+    return UserRepository(session)
+
+
+user_repository_dep = Annotated[UserRepository, Depends(get_user_repository)]
+
+
+async def get_resume_repository(session: session_dep) -> ResumeRepository:
+    return ResumeRepository(session)
+
+
+resume_repository_dep = Annotated[ResumeRepository, Depends(get_resume_repository)]
+
+
+from typing import Annotated
+
+from fastapi.params import Depends
+
+from src.api.DI.repository_depends import user_repository_dep, resume_repository_dep
+from src.services.auth_service import AuthService
+from src.services.resume_service import ResumeService
+
+
+async def get_auth_service(repository: user_repository_dep) -> AuthService:
+    return AuthService(repository)
+
+auth_service_dep = Annotated[AuthService, Depends(get_auth_service)]
+
+
+async def get_resume_service(repository: resume_repository_dep) -> ResumeService:
+    return ResumeService(repository)
+
+
+resume_service_dep = Annotated[ResumeService, Depends(get_resume_service)]
+
+
+
+from typing import Annotated, AsyncGenerator
+
+from fastapi.params import Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.config import async_session
+
+
+async def get_session() -> AsyncGenerator:
+    async with async_session() as session:
+        try:
+            yield session
+        except Exception as e:
+            await session.rollback()
+            raise e
+        finally:
+            await session.close()
+
+session_dep = Annotated[AsyncSession, Depends(get_session)]
+
+
+
+
+from typing import Any, Annotated
+
+from fastapi import HTTPException
+from fastapi.params import Depends
+from starlette.requests import Request
+
+from src.api.DI.service_depends import auth_service_dep
+from src.security.jwt import decode_token
+
+
+async def get_current_user(request: Request, service: auth_service_dep):
+    access_token = request.cookies.get('access_token')
+    if not access_token:
+        raise HTTPException(401, "Not authorized")
+    payload = await decode_token(access_token)
+    user_id = payload.get('user_id')
+    try:
+        user = service.get_user(user_id)
+        return user
+    except KeyError:
+        raise HTTPException(403, "No access")
+
+
+user_dep = Annotated[Any, Depends(get_current_user)]
+
+
+async def get_current_user_id(request: Request):
+    access_token = request.cookies.get('access_token')
+    if not access_token:
+        raise HTTPException(401, "Not authorized")
+    payload = await decode_token(access_token)
+    user_id = payload.get('user_id')
+    return user_id
+
+
+user_id_dep = Annotated[int, Depends(get_current_user_id)]
+
+
+from asyncpg import PostgresError
+from fastapi import APIRouter, HTTPException
+from sqlalchemy.exc import IntegrityError
+from starlette.requests import Request
+from starlette.responses import Response
+
+from src.api.DI.service_depends import auth_service_dep
+from src.schemas.AuthSchemas import RegisterUserSchema, LoginUserSchema, BaseGetUserSchema
+
+router = APIRouter(prefix='/auth', tags=["Auth"])
+
+
+@router.post('/register')
+async def register(response:Response, data: RegisterUserSchema, service: auth_service_dep):
+    try:
+        user_id = await service.register(data)
+        tokens = await service.get_tokens(user_id)
+
+        response.set_cookie(
+            "access_token",
+            tokens["access_token"],
+            max_age=1800,
+            secure=True,
+            httponly=True,
+            samesite="lax"
+        )
+        response.set_cookie(
+            "refresh_token",
+            tokens["refresh_token"],
+            max_age=43200 * 60,
+            secure=True,
+            httponly=True,
+            samesite="lax"
+        )
+
+        return {'ok': True, 'detail': 'Вы успешно зарегистрировались'}
+    except IntegrityError:
+        raise HTTPException(status_code=409, detail="Пользователь с таким email уже зарегистрирован")
+    except PostgresError:
+        raise HTTPException(status_code=500, detail='Ошибка сервера')
+
+
+@router.post('/login')
+async def login(response: Response, data: LoginUserSchema, service: auth_service_dep) -> BaseGetUserSchema:
+    try:
+        user = await service.login(data)
+        tokens = await service.get_tokens(user.id)
+        response.set_cookie(
+            "access_token",
+            tokens["access_token"],
+            max_age=1800,
+            secure=True,
+            httponly=True,
+            samesite="lax"
+        )
+        response.set_cookie(
+            "refresh_token",
+            tokens["refresh_token"],
+            max_age=43200 * 60,
+            secure=True,
+            httponly=True,
+            samesite="lax"
+        )
+
+        return user
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Пользователь с указанным email не найден")
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Введен неверный пароль")
+    except PostgresError:
+        raise HTTPException(status_code=500, detail='Ошибка сервера')
+
+
+@router.post('/refresh')
+async def refresh(request: Request, response: Response, service: auth_service_dep):
+    refresh_token = request.cookies.get("refresh_token")
+    if not refresh_token:
+        raise HTTPException(401, "Not  authorized")
+    access_token = await service.refresh(refresh_token)
+    response.set_cookie(
+        "access_token",
+        access_token,
+        max_age=1800,
+        secure=True,
+        httponly=True,
+        samesite="lax"
+    )
+    return {'ok': True, 'access_token': access_token}
+
+
+@router.post('/logout')
+async def logout(response: Response):
+    response.delete_cookie('access_token')
+    response.delete_cookie('refresh_token')
+    return {'ok': True, 'detail': "Вы вышли из системы"}
+
+
+
+from asyncpg import PostgresError
+from fastapi import APIRouter, HTTPException
+
+from src.api.DI.service_depends import resume_service_dep
+from src.api.DI.user_depends import user_id_dep
+from src.schemas.PaginationSchemas import pagination_dep
+from src.schemas.ResumeSchemas import ResumeSchema
+
+router = APIRouter(prefix='/resume', tags=["Resume"])
+
+
+@router.post('/new')
+async def create_resume(resume_data: ResumeSchema, user_id: user_id_dep, service: resume_service_dep) -> ResumeSchema:
+    try:
+        resume = await service.create_resume(resume_data, user_id)
+        return resume
+    except PostgresError:
+        raise HTTPException(status_code=500, detail='Ошибка сервера')
+
+
+@router.get('/user/{user_id}/resumes')
+async def get_resumes_list(user_id: int, pagination: pagination_dep, service: resume_service_dep) -> list[ResumeSchema]:
+    try:
+        resumes = await service.get_resumes(user_id, pagination)
+        return resumes
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Не найдено ни одного резюме")
+    except PostgresError:
+        raise HTTPException(status_code=500, detail='Ошибка сервера')
+
+
+@router.get('/{resume_id}')
+async def get_resume_by_id(resume_id: int, service: resume_service_dep):
+    try:
+        resume = await service.get_resume(resume_id)
+        return resume
+    except KeyError:
+        raise HTTPException(status_code=404, detail='Резюме не найдено')
+    except PostgresError:
+        raise HTTPException(status_code=500, detail='Ошибка сервера')
+
+@router.put('{resume_id}/edit')
+async def edit_resume(
+        resume_id: int,
+        new_resume_data: ResumeSchema,
+        user_id: user_id_dep,
+        service: resume_service_dep) -> ResumeSchema:
+    try:
+        updated_resume = await service.edit_resume(resume_id, user_id, new_resume_data)
+        return updated_resume
+    except KeyError:
+        raise HTTPException(status_code=404, detail='Резюме не найдено')
+    except PostgresError:
+        raise HTTPException(status_code=500, detail='Ошибка сервера')
+
+@router.delete('{resume_id}/delete')
+async def delete_resume(resume_id: int, user_id: user_id_dep, service: resume_service_dep):
+    try:
+        resume_id = await service.delete_resume(resume_id, user_id)
+        return {'ok': True, 'detail': f'Резюме {resume_id} успешно удалено'}
+    except KeyError:
+        raise HTTPException(status_code=404, detail='Резюме не найдено')
+    except PostgresError:
+        raise HTTPException(status_code=500, detail='Ошибка сервера')
+
+
+
+from typing import List, Annotated
+
+from sqlalchemy import String, ForeignKey, CheckConstraint
+from sqlalchemy.orm import Mapped, mapped_column, DeclarativeBase, relationship
+
+pk = Annotated[int, mapped_column(primary_key=True, autoincrement=True)]
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class User(Base):
+    __tablename__ = 'users'
+
+    id: Mapped[pk]
+    email: Mapped[str] = mapped_column(String(256), unique=True, index=True, nullable=False)
+    password: Mapped[str] = mapped_column(String(256), nullable=False)
+    first_name: Mapped[str] = mapped_column(String(64), default="Пользователь")
+    last_name: Mapped[str] = mapped_column(String(64), nullable=True)
+    resumes_rel: Mapped[List["Resume"]] = relationship(back_populates='user_rel')
+
+
+class Resume(Base):
+    __tablename__ = 'resumes'
+
+    id: Mapped[pk]
+    title: Mapped[str] = mapped_column(String(64), nullable=False)
+    content: Mapped[str] = mapped_column(String(1024), nullable=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey('users.id', ondelete="CASCADE"))
+    user_rel: Mapped["User"] = relationship(back_populates='resumes_rel')
+
+
+    __table_args__ = (
+        CheckConstraint("compensation < 10000000 AND compensation > 0", name="check_priority_range"),
+    )
+
+
+
+from sqlalchemy import select, Sequence, update, delete
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.db.models.models import Resume
+from src.schemas.ResumeSchemas import ResumeSchema
+
+
+class ResumeRepository:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def add(self, resume_data: ResumeSchema, user_id: int) -> Resume:
+        resume_dict = resume_data.model_dump()
+        resume = Resume(**resume_dict, user_id = user_id)
+        self.session.add(resume)
+        await self.session.commit()
+        return resume
+
+
+    async def get_list(self, user_id: int, offset: int, limit: int) -> Sequence[Resume]:
+        stmt = (
+            select(Resume)
+            .where(
+                Resume.user_id == user_id,
+                Resume.id > offset)
+            .limit(limit))
+        result = await self.session.execute(stmt)
+        resumes = result.scalars().all()
+        return resumes
+
+
+    async def get_resume(self, resume_id: int) -> Resume:
+        stmt = (
+            select(Resume)
+            .where(Resume.id == resume_id)
+        )
+        result = await self.session.execute(stmt)
+        resumes = result.scalars().one_or_none()
+        return resumes
+
+
+    async def update(self, resume_id: int, user_id: int, new_data: ResumeSchema) -> Resume:
+        new_data_dict = new_data.model_dump()
+        stmt = (
+            update(
+                Resume
+            )
+            .where(
+                Resume.id == resume_id,
+                Resume.user_id == user_id
+            )
+            .values(
+                **new_data_dict
+            )
+            .returning(
+                Resume
+            )
+        )
+        result = await self.session.execute(stmt)
+        await self.session.commit()
+        updated_resume = result.scalars().first()
+        return updated_resume
+
+
+    async def delete_by_id(self, resume_id: int, user_id: int) -> int:
+        stmt = (
+            delete(Resume)
+            .where(
+                Resume.id == resume_id,
+                Resume.user_id == user_id
+            )
+            .returning(Resume.id)
+        )
+        result = await self.session.execute(stmt)
+        await self.session.commit()
+        deleted_resume_id = result.scalars().first()
+        return deleted_resume_id
+
+
+from typing import Dict
+
+from pydantic import EmailStr
+from sqlalchemy import update, select, func
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.db.models.models import User, Resume
+from src.schemas.AuthSchemas import RegisterUserSchema, GetUserSchema
+
+
+class UserRepository:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def add(self, user_data: Dict[str, str]) -> int:
+        """
+        Добавление пользователя в БД
+        :param user_data: RegisterUserSchema
+        :return: int
+        """
+        new_user = User(**user_data)
+        self.session.add(new_user)
+        await self.session.commit()
+        return new_user.id
+
+
+    async def get_by_email(self, email: EmailStr):
+        """
+        Получение пользователя по email
+        :param email:
+        :return:
+        """
+        stmt = (
+            select(User)
+            .where(User.email == email)
+        )
+        result = await self.session.execute(stmt)
+        return result.scalars().one_or_none()
+
+
+    async def get_by_id(self, id: int):
+        stmt = select(User).where(User.id == id)
+        result = await self.session.execute(stmt)
+        return result.scalars().one_or_none()
+
+
+    async def get_user(self, id: int):
+        """
+        Получение данных пользователя и количество его резюме
+        :param id:
+        :return:
+        """
+        subq_resume_counter = (
+            select(func.count(Resume.id))
+            .where(Resume.user_id == id)
+            .label("resumes_count")
+            .group_by(Resume.id)
+            .subquery())
+
+        stmt = (select(User)
+                .where(User.id == id))
+
+
+        stmt = stmt.join(subq_resume_counter)
+        result = await self.session.execute(stmt)
+        return result.one_or_none
+
+
+
+    async def change_password_by_id(self, id: int, hash_password: str):
+        """
+        Меняем хеш пароля пользователя по его ID
+        :param id:
+        :param hash_password:
+        :return: bool
+        """
+        stmt = (update(User)
+                .where(User.id == id)
+                .values(password=hash_password))
+        await self.session.execute(stmt)
+        await self.session.commit()
+        return True
+
+
+
+        from typing import Dict, Optional
+
+from pydantic import BaseModel, EmailStr, Field, model_validator
+
+
+class BaseGetUserSchema(BaseModel):
+    first_name: Optional[str] = Field(default="Пользователь", description="Имя", max_length=64)
+    last_name: Optional[str] = Field(default='', description="Фамилия", max_length=64)
+
+class GetUserSchema(BaseGetUserSchema):
+    resumes_count: int = Field("Счетчик резюме пользователя")
+
+class LoginUserSchema(BaseModel):
+    email: EmailStr = Field(description="Email пользователя")
+    password: str = Field(default='', description="Пароль", min_length=8)
+
+
+class RegisterUserSchema(LoginUserSchema):
+    first_name: Optional[str] = Field(default="Пользователь", description="Имя", max_length=64)
+    last_name: Optional[str] = Field(default=None, description="Фамилия", max_length=64)
+    password_repeat: str = Field(default='', description="Повтор пароля", min_length=8)
+
+    @model_validator(mode="before")
+    def validate(cls, value: Dict[str, str]) -> Dict[str, str]:
+        password = value.get('password', None)
+        password_repeat = value.get('password_repeat', None)
+        if password != password_repeat:
+            raise ValueError("Passwords doesn't match. Check it again.")
+        return value
+
+
+class ChangePasswordSchema(BaseModel):
+    old_password: str = Field(min_length=8, description="Старый пароль")
+    new_password: str = Field(min_length=8, description="Новый пароль")
+    new_password_repeat: str = Field(min_length=8, description="Подтверждение пароля")
+
+    @model_validator(mode="before")
+    def validate(cls, value: Dict[str, str]) -> Dict[str, str]:
+        new_password = value.get('new_password', None)
+        new_password_repeat = value.get('new_password_repeat', None)
+        if new_password != new_password_repeat:
+            raise ValueError("New password and confirm doesn't match")
+        return value
+
+
+from typing import Annotated
+
+from fastapi import Query
+from pydantic import BaseModel, Field
+
+
+
+class Pagination(BaseModel):
+    cursor_offset: int = Field(default=0)
+    limit: int = Field(default=10, description='Количество резюме в ответе')
+
+
+pagination_dep = Annotated[Pagination, Query(...)]from pydantic import BaseModel, Field
+
+
+class ResumeSchema(BaseModel):
+    title: str = Field(max_length=64, description="Название резюме")
+    content: str = Field(max_length=1024, description="Контент резюме")
+
+
+
+from passlib.context import CryptContext
+
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+async def hash_password(raw_password: str):
+    hashed_password = pwd_context.hash(raw_password)
+    return hashed_password
+
+
+async def verify_password(hashed_password: str, raw_password: str):
+    verify_status = pwd_context.verify(raw_password, hashed_password)
+    return verify_status
+
+
+from datetime import timedelta, timezone, datetime
+
+from jose import jwt, JWTError
+
+from src.config import get_jwt_data
+
+
+async def create_token(data: dict, token_type: str = "access"):
+    jwt_data = await get_jwt_data()
+    expire = datetime.now(timezone.utc) + timedelta(minutes=jwt_data["expire_access"])
+    to_encode = data.copy()
+    if token_type == "access":
+        to_encode.update({"exp": expire, "type": "access"})
+    elif token_type == "refresh":
+        expire = datetime.now(timezone.utc) + timedelta(minutes=jwt_data["expire_refresh"])
+        to_encode.update({
+            "exp": expire,
+            "type": "refresh"})
+    else:
+        return None
+    encode_jwt = jwt.encode(to_encode, jwt_data['secret_key'], algorithm=jwt_data['algorithm'])
+    return encode_jwt
+
+
+async def decode_token(token: str):
+    jwt_data = await get_jwt_data()
+    try:
+        payload = jwt.decode(token, jwt_data['secret_key'], algorithms=jwt_data['algorithm'])
+        return payload
+    except JWTError:
+        return None
+
+
+import logging
+from typing import Dict
+
+from asyncpg import PostgresError
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
+
+from src.db.repositories.user_repository import UserRepository
+from src.schemas.AuthSchemas import RegisterUserSchema, LoginUserSchema
+from src.security.auth import verify_password, hash_password
+from src.security.jwt import create_token, decode_token
+
+
+
+
+
+class AuthService:
+    def __init__(self, repository: UserRepository):
+        self.repository = repository
+        self.logger = logging.getLogger(__name__)
+
+    async def get_tokens(self, user_id: int) -> Dict:
+        data = {"user_id": user_id}
+        access_token = await create_token(data)
+        refresh_token = await create_token(data, token_type="refresh")
+
+        return {"access_token": access_token, "refresh_token": refresh_token}
+
+    async def register(self, user_data: RegisterUserSchema) -> int:
+        """
+        Регистрация пользователя
+        :param user_data: RegisterUserSchema
+        :return: int
+        """
+        user_schema = user_data
+        try:
+            user_schema.password = await hash_password(user_schema.password)
+            register_data = user_schema.model_dump(exclude={'password_repeat'})
+            try:
+                user_id = await self.repository.add(register_data)
+                return user_id
+            except IntegrityError as exc:
+                self.logger.error(f"Ошибка добавления в БД {exc}")
+                raise exc
+        except PostgresError as exc:
+            self.logger.error(f"Ошибка взаимодействия с базой данных {exc}")
+            raise exc
+
+
+    async def login(self, login_data: LoginUserSchema):
+        """
+        Вход с помощью email и пароля
+        :param login_data:
+        :return:
+        """
+        try:
+            user = await self.repository.get_by_email(login_data.email)
+            if user is None:
+                raise KeyError("Пользователь не найден")
+            is_valid_password = await verify_password(user.password, login_data.password)
+            if not is_valid_password:
+                raise ValueError("Неверный пароль")
+
+            return user
+        except (PostgresError, SQLAlchemyError) as exc:
+            self.logger.error(f"Ошибка взаимодействия с базой данных {exc}")
+            raise exc
+
+    async def get_user_by_id(self, id: int):
+        try:
+            user = await self.repository.get_by_id(id)
+            if user is None:
+                raise KeyError("Пользователь не найден")
+            return user
+        except (PostgresError, SQLAlchemyError) as exc:
+            self.logger.error(f"Ошибка взаимодействия с базой данных {exc}")
+            raise exc
+
+
+    async def get_user(self, id: int):
+        """
+        Получения данных пользователя по его ID
+        :param id:
+        :return:
+        """
+        try:
+            user = await self.repository.get_user(id)
+            if user is None:
+                raise KeyError("Пользователь не найден")
+            return user
+        except (PostgresError, SQLAlchemyError) as exc:
+            self.logger.error(f"Ошибка взаимодействия с базой данных {exc}")
+            raise exc
+
+
+    async def refresh(self, refresh_token: str) -> str | None:
+        """
+        Обновление access token'а
+        :param refresh_token:
+        :return:
+        """
+        print(refresh_token)
+        token_data = await decode_token(refresh_token)
+        print(token_data)
+        if token_data.get("type") != "refresh":
+            return None
+        user_id = token_data["user_id"]
+        access_token = await create_token({"user_id": user_id})
+        return access_token
+
+
+        import logging
+
+from asyncpg import PostgresError
+from sqlalchemy import Sequence
+
+from src.db.models.models import Resume
+from src.db.repositories.resume_repository import ResumeRepository
+from src.schemas.PaginationSchemas import Pagination
+from src.schemas.ResumeSchemas import ResumeSchema
+
+
+class ResumeService:
+    def __init__(self, repository: ResumeRepository):
+        self.repository = repository
+        self.logger = logging.getLogger(__name__)
+
+    async def create_resume(self, resume_data: ResumeSchema, user_id: int) -> Resume:
+        try:
+            resume = await self.repository.add(resume_data, user_id)
+            return resume
+        except PostgresError as exc:
+            self.logger.error(f"Ошибка взаимодействия с базой данных {exc}")
+            raise exc
+
+    async def get_resumes(self, user_id: int, pagintion: Pagination) -> Sequence[Resume]:
+        try:
+            resumes = await self.repository.get_list(user_id, pagintion.cursor_offset, pagintion.limit)
+            if not resumes:
+                raise KeyError("Не найдено ни одного резюме")
+            return resumes
+        except PostgresError as exc:
+            self.logger.error(f"Ошибка взаимодействия с базой данных {exc}")
+            raise exc
+
+
+    async def get_resume(self, resume_id: int) -> Resume:
+        try:
+            resume = await self.repository.get_resume(resume_id)
+            if not resume:
+                raise KeyError("Резюме не найдено")
+            return resume
+        except PostgresError as exc:
+            self.logger.error(f"Ошибка взаимодействия с базой данных {exc}")
+            raise exc
+
+    async def edit_resume(self, resume_id: int, user_id: int, new_data: ResumeSchema) -> Resume:
+        try:
+            updated_resume = await self.repository.update(resume_id, user_id, new_data)
+            if not updated_resume:
+                raise KeyError("Резюме не найдено.")
+            return updated_resume
+        except PostgresError as exc:
+            self.logger.error(f"Ошибка взаимодействия с базой данных {exc}")
+            raise exc
+
+    async def delete_resume(self, resume_id: int, user_id: int) -> int:
+        try:
+            deleted_resume_id = await self.repository.delete_by_id(resume_id, user_id)
+            if not deleted_resume_id:
+                raise KeyError("Резюме не найдено.")
+            return deleted_resume_id
+        except PostgresError as exc:
+            self.logger.error(f"Ошибка взаимодействия с базой данных {exc}")
+            raise exc
+import os
+from typing import Dict
+
+from dotenv import load_dotenv
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine, async_sessionmaker
+
+load_dotenv()
+
+def get_db_url():
+    return (f"postgresql+asyncpg://"
+            f"{os.getenv('DB_USER')}:"
+            f"{os.getenv('DB_PASSWORD')}@"
+            f"{os.getenv('DB_HOST')}:"
+            f"{os.getenv('DB_PORT')}/"
+            f"{os.getenv('DB_NAME')}")
+
+
+def get_engine() -> AsyncEngine:
+    db_url = get_db_url()
+    engine = create_async_engine(url=db_url)
+    return engine
+
+
+async def get_jwt_data() -> Dict[str, str| float]:
+    return {
+        "secret_key": os.getenv("SECRET_KEY"),
+        "algorithm": os.getenv("ALGORITHM"),
+        "expire_access": float(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES")),
+        "expire_refresh": float(os.getenv("REFRESH_TOKEN_EXPIRE_MINUTES"))
+    }
+
+
+async_session = async_sessionmaker(get_engine(), expire_on_commit=False)
